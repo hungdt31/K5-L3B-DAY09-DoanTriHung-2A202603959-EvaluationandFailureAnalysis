@@ -11,11 +11,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 from lab8.console import utf8_stdio
 from lab9 import stats
 from lab9.eval import SPEC, load_spec, per_item
+
+SUMMARY_METRICS = (
+    {"pass_5", "cost_per_success"}
+    | {f"pass_at_{k}" for k in range(1, 20)}
+    | {f"pass_hat_{k}" for k in range(1, 20)}
+)
 
 
 def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = None) -> list[str]:
@@ -33,8 +40,99 @@ def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = N
         including dropping no_significant_drop)
       - an item's slice tags in PR rows differ from the baseline's (relabelling an item out of a
         slice hides its regression from the slice gate)"""
-    # TODO M7
-    return []
+    problems: list[str] = []
+    pr_metrics = pr.get("metrics") or {}
+    for k, v in pr_metrics.items():
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            problems.append(f"metric {k} is {v}")
+
+    if pr.get("evaluator_failures"):
+        problems.append(f"evaluator_failures is non-empty ({len(pr['evaluator_failures'])})")
+
+    pr_rows = pr.get("rows") or []
+    base_rows = base.get("rows") or []
+    manifest = pr.get("manifest") or {}
+    base_manifest = base.get("manifest") or {}
+    expected_len = int(manifest.get("items") or 0) * len(manifest.get("seeds") or [])
+    if expected_len and len(pr_rows) != expected_len:
+        problems.append(f"row count {len(pr_rows)} != manifest items*seeds ({expected_len})")
+    if len(pr_rows) != len(base_rows):
+        problems.append(f"row count {len(pr_rows)} != baseline row count ({len(base_rows)})")
+
+    if manifest.get("items") != base_manifest.get("items") or list(manifest.get("seeds") or []) != list(base_manifest.get("seeds") or []):
+        problems.append("manifest items or seeds differ from baseline")
+
+    pr_pairs = [(r.get("item_id"), r.get("seed")) for r in pr_rows]
+    base_pairs = [(r.get("item_id"), r.get("seed")) for r in base_rows]
+    if len(set(pr_pairs)) != len(pr_pairs):
+        problems.append("duplicate (item_id, seed) rows in PR")
+    if set(pr_pairs) != set(base_pairs):
+        problems.append("PR (item_id, seed) set differs from baseline")
+
+    row_metric_ids = [
+        m["id"]
+        for m in (spec.get("metrics") or [])
+        if m["id"] not in SUMMARY_METRICS
+        and (m.get("kind") in ("safety", "capability") or any(m["id"] in r for r in base_rows))
+    ]
+    for mid in row_metric_ids:
+        for r in pr_rows:
+            val = r.get(mid)
+            if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+                problems.append(f"row {r.get('item_id')}@{r.get('seed')} has missing/NaN value for {mid}")
+                break
+        vals = [r.get(mid) for r in pr_rows if isinstance(r.get(mid), (bool, int, float)) and not (isinstance(r.get(mid), float) and math.isnan(r.get(mid)))]
+        mval = pr_metrics.get(mid)
+        if vals and len(vals) == len(pr_rows) and isinstance(mval, (int, float)) and not math.isnan(mval) and not math.isinf(mval):
+            expected_agg = sum(vals) if mid in ("secret_leak", "approval_bypass") else round(sum(vals) / len(vals), 4)
+            if abs(float(mval) - float(expected_agg)) > 1e-3:
+                problems.append(f"metric {mid}={mval} disagrees with row aggregate {expected_agg}")
+
+    base_slices = {(r.get("item_id"), r.get("seed")): sorted(r.get("slices") or []) for r in base_rows}
+    for r in pr_rows:
+        key = (r.get("item_id"), r.get("seed"))
+        if key in base_slices and sorted(r.get("slices") or []) != base_slices[key]:
+            problems.append(f"slice tags for {key[0]}@{key[1]} differ from baseline")
+            break
+
+    if base_spec is not None and spec.get("eval_set_version") == base_spec.get("eval_set_version"):
+        cur_metrics = {m["id"]: m for m in (spec.get("metrics") or [])}
+        for bm in base_spec.get("metrics") or []:
+            mid = bm["id"]
+            if mid not in cur_metrics:
+                problems.append(f"ratchet: metric {mid} removed from spec")
+                continue
+            pm = cur_metrics[mid]
+            if bm.get("blocking") and not pm.get("blocking"):
+                problems.append(f"ratchet: metric {mid} became non-blocking")
+            bth = bm.get("threshold") or {}
+            pth = pm.get("threshold") or {}
+            if "min" in bth and ("min" not in pth or float(pth["min"]) < float(bth["min"])):
+                problems.append(f"ratchet: metric {mid} min lowered from {bth['min']} to {pth.get('min')}")
+            if "max" in bth and ("max" not in pth or float(pth["max"]) > float(bth["max"])):
+                problems.append(f"ratchet: metric {mid} max raised from {bth['max']} to {pth.get('max')}")
+            if "max_increase" in bth and ("max_increase" not in pth or float(pth["max_increase"]) > float(bth["max_increase"])):
+                problems.append(f"ratchet: metric {mid} max_increase raised")
+            if bth.get("no_significant_drop") and not pth.get("no_significant_drop"):
+                problems.append(f"ratchet: metric {mid} dropped no_significant_drop")
+
+        cur_slices = {(s["name"], s["metric"]): s for s in (spec.get("slices") or [])}
+        for bs in base_spec.get("slices") or []:
+            skey = (bs["name"], bs["metric"])
+            if skey not in cur_slices:
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} removed from spec")
+                continue
+            ps = cur_slices[skey]
+            if bs.get("blocking") and not ps.get("blocking"):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} became non-blocking")
+            if "min" in bs and ("min" not in ps or float(ps["min"]) < float(bs["min"])):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} min lowered")
+            if "max" in bs and ("max" not in ps or float(ps["max"]) > float(bs["max"])):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} max raised")
+            if bs.get("no_significant_drop") and not ps.get("no_significant_drop"):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} dropped no_significant_drop")
+
+    return problems
 
 
 def slice_check(pr: dict, base: dict, spec: dict) -> tuple[list[str], list[str]]:
