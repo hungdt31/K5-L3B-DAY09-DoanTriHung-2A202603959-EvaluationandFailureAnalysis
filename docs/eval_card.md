@@ -48,3 +48,30 @@ Card này đi kèm mỗi báo cáo và được dùng lại ở Day 10.
 - **Khi nào tăng eval-set version:**
   - Khi thêm câu hỏi mới vào bộ đề (ví dụ đưa các ca lỗi mới từ production/trace case hoặc bổ sung gói đối kháng `adversarial_v2.json` tạo thành `eval_set_v2.jsonl`) hoặc sửa nhãn chuẩn `labels`, bắt buộc phải nâng `eval_set_version` (từ `v1` lên `v2`) và chạy lại baseline mới trên nhánh `main`. Tuyệt đối không xóa bớt câu khó trong cùng một version để làm đẹp điểm số.
 
+---
+
+## Phần mở rộng v2 (M5–M7: Adversarial Pack, Slice Gate, `pass@k`/`pass^k` & Integrity Check)
+
+- **Run ID / Eval Set v2 SHA:**
+  - Baseline v2 (`swarm`): `E-swarm-20261118-f38d` (`reports/baseline_v2.json`)
+  - Slice Regression (`slice_regression`): `E-slice_regression-20261118-f38d` (`reports/eval_slice_regression.json`)
+  - Eval set v2 (`src/data/eval/eval_set_v2.jsonl`, `28 items × 5 seeds = 140 trials`, gộp 14 câu `v1` + 14 câu `adversarial_v2.json`): SHA `f38d26fa1811`
+  - Cấu hình: `metric_spec_version: "2.0"` (`src/config/metric_spec_v2.yaml`), ánh xạ `src/config/fm_map.yaml` (`0 problem(s)`).
+
+- **Kiểm tra nhiễu A/A (`--aa 66,77,88,99,110`) và cách chọn ngưỡng `pass_hat_5`:**
+  - Chạy `python -m lab9.mutation --spec config/metric_spec_v2.yaml --aa 66,77,88,99,110` so sánh hai bộ seed `[11, 22, 33, 44, 55]` và `[66, 77, 88, 99, 110]` trên cùng agent `swarm`:
+    - `pass_rate = 0.9786` ($\Delta = +0.0000$), `pass_at_1 = 0.9786`, `pass_at_3 = 1.0`, `pass_at_5 = 1.0`.
+    - `pass_hat_1 = 0.9786`, `pass_hat_3 = 0.9357`, `pass_hat_5 = 0.8929` ($\Delta = +0.0000$).
+  - **Vì sao trên `MockLLM` $\Delta = 0$ nhưng trên LLM thật dải nhiễu $> 0$:** `MockLLM` hoàn toàn tất định theo phép chia dư của seed (ví dụ `seed % 5 == 0` xuất hiện đúng 1/5 lần ở cả hai bộ seed: `55` và `110`), nên trung bình không đổi. Ngược lại, với LLM thật có `temperature > 0` và sai số lấy mẫu hữu hạn ($k=5$ lần chạy), điểm `pass_hat_5` của cùng một model giữa 2 tập seed sẽ dao động trong một dải nhiễu (A/A noise band). Nếu đặt ngưỡng sàn nằm bên trong dải nhiễu của baseline (`0.8929`), cổng CI sẽ chặn nhầm (false alarm) các PR trung thực. Do đó ta chọn ngưỡng sàn **`pass_hat_5 >= 0.85`** (`blocking: true`): vừa cao hơn mức tối thiểu `0.80`, vừa nằm dưới baseline `0.8929` một khoảng an toàn ngoài dải nhiễu, nhưng đủ cao để chặn đứng `flaky_regression` (`pass_hat_5 = 0.4286 < 0.85`).
+
+- **Slice nào bắt lỗi nào (M5 Slice Gate):**
+  - `slice:money_movement` (`pass_rate >= 0.90`, `refund_amount_correct >= 0.90`, `no_significant_drop: true`, `blocking: true`): bắt trực tiếp các hồi quy tính toán số tiền chỉ xảy ra ở nhóm đơn có hoàn tiền như **`slice_regression`** (`sum_parts` ở seed lẻ). Trên `slice_regression`, `pass_rate` trung bình toàn cục đạt `0.9357 >= 0.85` và CI `[-0.121, +0.029]` chạm 0 (nên thoát khỏi cổng toàn cục), nhưng trên `slice:money_movement` điểm tụt xuống `0.8500 < 0.90` ($\Delta = -0.150$) và bị **BLOCK**.
+  - `slice:denial` (`pass_rate >= 0.90`, `no_significant_drop: true`, `blocking: true`): bắt các lỗi hoàn tiền oan trên nhóm đơn phải từ chối như `stale_clause` (`FM-06`), `ticket_trust` (`FM-03`), `ignore_denied` (`FM-02`).
+  - `slice:adversarial` (`pass_rate >= 0.90`, `refund_amount_correct >= 0.90`, `no_significant_drop: true`, `blocking: true`): bắt các lỗi trước tấn công prompt injection, giả mạo quyền hạn, trích dẫn điều khoản hết hạn và truy cập chéo `cross_principal` (`FM-09`).
+
+- **Giới hạn cỡ mẫu (Sample-size limitation với lỗi hiếm `rare` 1/3 seeds):**
+  - Với bộ seed mặc định `[11, 22, 33, 44, 55]`, một công tắc lỗi có điều kiện kích hoạt `seed % 3 == 0` (`rare`) chỉ bật trên đúng **1/5 seed** (`seed = 33`, tức $20\%$ số lần chạy).
+  - Nếu lỗi đó chỉ tác động lên một vài claim đơn lẻ, mức sụt giảm trên `pass_rate` trung bình 5 seeds chỉ là $0.20 / 28 \approx 0.007$ mỗi claim — nhỏ hơn nhiều so với bề rộng khoảng tin cậy bootstrap của 28 items $\times$ 5 seeds, nên **không thể phát hiện ổn định bằng `pass_rate` trung bình với chỉ 5 seeds**.
+  - Cách xử lý đúng là kết hợp chỉ số độ tin cậy **`pass_hat_5`** (một item chỉ cần fail 1/5 seed là $\text{pass}\text{\textasciicircum}5 = \binom{4}{5}/\binom{5}{5} = 0$, làm `pass_hat_5` tụt mạnh từ `1.0` xuống `0.4286` trên `flaky_regression`) hoặc tăng số lượng seeds $n \ge 15$ khi cần bắt lỗi xác suất thấp, **tuyệt đối không hạ thấp hay bóp méo ngưỡng sàn toàn cục tới mức gây báo động giả (false alarm) trên các bản refactor trung thực**.
+
+
